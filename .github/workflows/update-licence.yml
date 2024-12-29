@@ -1,0 +1,31 @@
+name: Update licence
+
+on:
+  schedule:
+    - cron: "0 7 1 1 *"
+  workflow_dispatch:
+
+jobs:
+  update-licence:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: "true"
+
+      - name: Install Python
+        uses: ./.github/actions/setup-py
+
+      - name: Update licence
+        run: nox -s update-licence
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@5e914681df9dc83aa4e4905692ca88beb2f9e91f
+        with:
+          author: "always-on-duty[bot] <120557446+always-on-duty[bot]@users.noreply.github.com>"
+          branch: task/update-licence
+          commit-message: Update licence
+          committer: "always-on-duty[bot] <120557446+always-on-duty[bot]@users.noreply.github.com>"
+          title: Update licence
+          token: ${{ secrets.ACTIONS_TOKEN || secrets.GITHUB_TOKEN }}
