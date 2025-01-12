@@ -33,9 +33,11 @@ import dataclasses
 import datetime
 import enum
 import hmac
+import uuid
 import io
 import logging
 import os
+import re
 import pathlib
 import subprocess
 import sys
@@ -55,7 +57,7 @@ import dotenv
 import fastapi
 import httpx
 import jwt
-import piped_shared
+from . import config
 import starlette.middleware
 from anyio.streams import memory as streams
 from asgiref import typing as asgiref
@@ -79,102 +81,54 @@ COMMIT_ENV = {
 }
 COMMIT_ENV["GIT_COMMITTER_EMAIL"] = COMMIT_ENV["GIT_AUTHOR_EMAIL"]
 CLIENT_SECRET = os.environ["CLIENT_SECRET"].encode()
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].encode()
 jwt_instance = jwt.JWT()
 
+_TAG_MATCH = re.compile(r"v.+\..+\..+")
 
-class _ProcessingIndex:
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class _ScopeIndex:
     """Index of the PRs being processed."""
 
-    __slots__ = ("_prs", "_repos")
+    _closed: bool = False
+    _scopes: dict[uuid.UUID, anyio.CancelScope] = dataclasses.field(default_factory=dict)
 
-    def __init__(self) -> None:
-        self._prs: dict[str, anyio.CancelScope] = {}
-        self._repos: dict[int, list[int]] = {}
+    def is_closed(self) -> bool:
+        return self._closed
 
-    def _pr_id(self, repo_id: int, pr_id: int, /) -> str:
-        return f"{repo_id}:{pr_id}"
+    @contextlib.contextmanager
+    def scope(self) -> collections.Generator[typing.Any, anyio.CancelScope]:
+        if self._closed:
+            raise RuntimeError("Closed")
+
+        scope = anyio.CancelScope()
+        scope_id = uuid.uuid4()
+        self._scopes[scope_id] = scope
+
+        try:
+            with scope:
+                yield scope
+
+        finally:
+            self._scopes.pop(scope_id, None)
 
     async def close(self) -> None:
-        """Cancel all active PR processing tasks."""
-        self._repos.clear()
-        prs = self._prs
-        self._prs = {}
+        """Cancel all active processing tasks."""
+        if self._closed:
+            raise RuntimeError("Already closed")
+
         _LOGGER.info("Stopping all current calls")
-        for scope in prs.values():
+
+        end_time = time.time() + (60 * 5)
+
+        while self._scopes and time.time() > end_time:
+            await anyio.sleep(0.5)
+
+        for scope in self._scopes.values():
             scope.cancel()
 
         await anyio.lowlevel.checkpoint()  # Yield to the loop to let these cancels propagate
-
-    def clear_for_repo(self, repo_id: int, /, *, repo_name: str | None = None) -> None:
-        """Cancel the active PR processing tasks for a Repo.
-
-        Parameters
-        ----------
-        repo_id
-            ID of the repo to cancel the active tasks for.
-        repo_name
-            Name of the repo to cancel the active tasks for.
-
-            Used for logging.
-        """
-        if prs := self._repos.get(repo_id):
-            repo_name = repo_name or str(repo_id)
-            _LOGGER.info("Stopping calls for all PRs in %s", repo_name)
-            for pr_id in prs:
-                self._prs.pop(self._pr_id(repo_id, pr_id)).cancel()
-
-    def stop_for_pr(self, repo_id: int, pr_id: int, /, *, repo_name: str | None = None) -> None:
-        """Cancel the active processing task for a PR.
-
-        Parameters
-        ----------
-        repo_id
-            ID of the repo to cancel an active task in.
-        pr_id
-            ID of the PR to cancel the active processing task for.
-        repo_name
-            Name of the repo to cancel an active task in.
-
-            Use for logging.
-        """
-        if pr := self._prs.pop(self._pr_id(repo_id, pr_id), None):
-            repo_name = repo_name or str(repo_id)
-            _LOGGER.info("Stopping call for %s:%s", repo_name, pr_id)
-            pr.cancel()
-
-    def start(self, repo_id: int, pr_id: int, /, *, repo_name: str | None = None) -> anyio.CancelScope:
-        """Create a cancel scope for processing a specific PR.
-
-        This will cancel any previous processing task for the passed PR.
-
-        Parameters
-        ----------
-        repo_id
-            ID of the repo to start a processing task for.
-        pr_id
-            ID of the pull request to start a processing task for.
-        repo_name
-            Name of the repo this task is in.
-
-            Use for logging.
-
-        Returns
-        -------
-        anyio.CancelScope
-            Cancel scope to use for this task.
-        """
-        key = self._pr_id(repo_id, pr_id)
-        repo_name = repo_name or str(repo_id)
-
-        if pr := self._prs.pop(key, None):
-            _LOGGER.info("Stopping previous call for for %s:%s", repo_name, pr_id)
-            pr.cancel()
-
-        _LOGGER.info("Starting call for %s:%s", repo_name, pr_id)
-        scope = anyio.CancelScope()
-        self._prs[key] = scope
-        return scope
 
 
 class _Tokens:
@@ -342,7 +296,7 @@ class _CachedReceive:
         return {"type": "http.request", "body": data, "more_body": False}
 
 
-async def _error_response(send: asgiref.ASGISendCallable, body: bytes, /, *, status_code: int = 400) -> None:
+async def _error_response(send: asgiref.ASGISendCallable, body: bytes = b"", /, *, status_code: int = 403) -> None:
     """Return a quick RESTful error response.
 
     Parameters
@@ -354,11 +308,16 @@ async def _error_response(send: asgiref.ASGISendCallable, body: bytes, /, *, sta
     status_code
         The error's status code.
     """
+    headers: list[tuple[bytes, bytes]] = []
+
+    if body:
+        headers.append((b"content-type", b"text/plain; charset=UTF-8"))
+
     await send(
         {
             "type": "http.response.start",
             "status": status_code,
-            "headers": [(b"content-type", b"text/plain; charset=UTF-8")],
+            "headers": headers,
             "trailers": False,
         }
     )
@@ -435,7 +394,7 @@ class AuthMiddleware:
 
         signature = _find_headers(scope, (b"x-hub-signature-256",)).get(b"x-hub-signature-256")
         if not signature:
-            await _error_response(send, b"Missing signature header")
+            await _error_response(send, b"")
             return
 
         more_body = True
@@ -449,7 +408,7 @@ class AuthMiddleware:
                 case _:
                     raise NotImplementedError
 
-        digest = "sha256=" + hmac.new(CLIENT_SECRET, payload, digestmod="sha256").hexdigest()
+        digest = "sha256=" + hmac.new(WEBHOOK_SECRET, payload, digestmod="sha256").hexdigest()
 
         if not hmac.compare_digest(signature.decode(), digest):
             await _error_response(send, b"Invalid signature", status_code=401)
@@ -469,66 +428,6 @@ class _WorkflowAction(str, enum.Enum):
     IN_PROGRESS = "in_progress"
     REQUESTED = "requested"
 
-
-class _WorkflowDispatch:
-    """Workflow dispatch tracker."""
-
-    __slots__ = ("_listeners",)
-
-    def __init__(self) -> None:
-        self._listeners: dict[
-            tuple[int, int, str], streams.MemoryObjectSendStream[tuple[int, str, _WorkflowAction]]
-        ] = {}
-
-    def consume_event(self, body: dict[str, typing.Any], /) -> None:
-        """Dispatch a workflow_run event.
-
-        Parameters
-        ----------
-        body
-            Dict body of the workflow_run event.
-        """
-        head_repo_id = int(body["workflow_run"]["head_repository"]["id"])
-        head_sha: str = body["workflow_run"]["head_sha"]
-        repo_id = int(body["repository"]["id"])
-
-        if send := self._listeners.get((repo_id, head_repo_id, head_sha)):
-            action = _WorkflowAction(body["action"])
-            name: str = body["workflow_run"]["name"]
-            workflow_id = int(body["workflow_run"]["id"])
-            send.send_nowait((workflow_id, name, action))
-
-    @contextlib.contextmanager
-    def track_workflows(
-        self, repo_id: int, head_repo_id: int, head_sha: str, /
-    ) -> collections.Generator["_IterWorkflows", None, None]:
-        """Async context manager which manages tracking the workflows for a PR.
-
-        Parameters
-        ----------
-        repo_id
-            ID of the repository to track workflows in.
-        head_repo_id
-            ID of the Repo the commit these workflows are targeting is in.
-        head_sha
-            Hash of the commit these workflows are targeting.
-
-        Returns
-        -------
-        _IterWorkflows
-            Async iterable of the received workflow finishes.
-
-            `_IterWorkflows.filter_names` should be used to set this to filter
-            for specific names before iterating over this.
-        """
-        key = (repo_id, head_repo_id, head_sha)
-        send, recv = anyio.create_memory_object_stream(1_000, item_type=tuple[int, str, _WorkflowAction])
-        self._listeners[key] = send
-
-        yield _IterWorkflows(recv)
-
-        send.close()
-        del self._listeners[key]
 
 
 class _IterWorkflows:
@@ -619,53 +518,47 @@ async def post_webhook(
 ) -> fastapi.Response:
     """Receive Github action triggered event webhooks."""
     assert isinstance(request.app.state.http, httpx.AsyncClient)
-    assert isinstance(request.app.state.index, _ProcessingIndex)
+    assert isinstance(request.app.state.index, _ScopeIndex)
     assert isinstance(request.app.state.tokens, _Tokens)
     assert isinstance(request.app.state.workflows, _WorkflowDispatch)
     http = request.app.state.http
     index = request.app.state.index
     tokens = request.app.state.tokens
     workflows = request.app.state.workflows
-    print(x_github_event, body)
-    return fastapi.Response(status_code=204)
     match (x_github_event, body):
-        case ("pull_request", {"action": "closed", "number": number, "repository": repo_data}):
-            index.stop_for_pr(int(repo_data["id"]), int(number), repo_name=repo_data["full_name"])
-            await anyio.lowlevel.checkpoint()  # Yield to the loop to let these cancels propagate
+        case ("create", {"ref": ref, "ref_type": "tag", "repository": repo_data}):
+            print("neet", ref, repo_data)
+            if _TAG_MATCH.fullmatch(ref.removeprefix("refs/tags/")):
+                ...
 
-        case ("pull_request", {"action": "opened" | "reopened" | "synchronize"}):
-            tasks.add_task(_process_repo, http, tokens, index, workflows, body)
-            return fastapi.Response(status_code=202)
+        case ("push", {"after": after, "deleted": False, "master_branch": master_branch, "ref": ref, "repository": repo_data}):
+            print("beat", after, master_branch, ref, repo_data)
+            if ref == f"refs/heads/{master_branch}":
+                print("beat me")
 
-        case ("workflow_run", _):
-            workflows.consume_event(body)
 
-        case ("installation", {"action": "removed", "repositories_removed": repositories_removed}):
-            for repo in repositories_removed:
-                index.clear_for_repo(int(repo["id"]))
+        # case ("pull_request", {"action": "closed", "number": number, "repository": repo_data}):
+        #     index.stop_for_pr(int(repo_data["id"]), int(number), repo_name=repo_data["full_name"])
+        #     await anyio.lowlevel.checkpoint()  # Yield to the loop to let these cancels propagate
 
-            await anyio.lowlevel.checkpoint()  # Yield to the loop to let these cancels propagate
+        # case ("pull_request", {"action": "opened" | "reopened" | "synchronize"}):
+        #     tasks.add_task(_process_repo, http, tokens, index, workflows, body)
+        #     return fastapi.Response(status_code=202)
 
-        case ("installation_repositories", {"action": "removed", "repositories": repositories}):
-            for repo in repositories:
-                index.clear_for_repo(int(repo["id"]))
+        # case ("workflow_run", _):
+        #     workflows.consume_event(body)
 
-            await anyio.lowlevel.checkpoint()  # Yield to the loop to let these cancels propagate
+        # case ("installation", {"action": "removed", "repositories_removed": repositories_removed}):
+        #     for repo in repositories_removed:
+        #         index.clear_for_repo(int(repo["id"]))
 
-        # Guard to let these expected but ignored cases still return 204
-        case (
-            # check_suite events are received for the bot's check suites
-            # regardless of configuration.
-            "check_suite"
-            | "github_app_authorization"
-            | "installation"
-            | "installation_repositories"
-            | "installation_target"
-            | "pull_request"
-            | "workflow_run",
-            _,
-        ):
-            pass
+        #     await anyio.lowlevel.checkpoint()  # Yield to the loop to let these cancels propagate
+
+        # case ("installation_repositories", {"action": "removed", "repositories": repositories}):
+        #     for repo in repositories:
+        #         index.clear_for_repo(int(repo["id"]))
+
+        #     await anyio.lowlevel.checkpoint()  # Yield to the loop to let these cancels propagate
 
         case _:
             _LOGGER.info(
@@ -725,7 +618,7 @@ class _RunCheck:
         repo_name
             The repo's full name in the format `"{owner_name}/{repo_name}"`.
         commit_hash
-            Hash of the PR commit this run is for.
+            Hash of the commit this run is for.
         """
         self._check_id = -1
         self._commit_hash = commit_hash
@@ -832,107 +725,32 @@ def _censor(value: str, filters: list[str], /) -> str:
 async def _process_repo(
     http: httpx.AsyncClient,
     tokens: _Tokens,
-    index: _ProcessingIndex,
+    index: _ScopeIndex,
     workflows: _WorkflowDispatch,
-    body: dict[str, typing.Any],
+
 ) -> None:
-    repo_data: dict[str, typing.Any] = body["repository"]
-    repo_id = int(repo_data["id"])
-    pr_id = int(body["number"])
-    full_name: str = repo_data["full_name"]
-    head_name: str = body["pull_request"]["head"]["repo"]["full_name"]
-    head_ref: str = body["pull_request"]["head"]["ref"]
-    head_repo_id = int(body["pull_request"]["head"]["repo"]["id"])
-    head_sha: str = body["pull_request"]["head"]["sha"]
-    installation_id = int(body["installation"]["id"])
 
     with (
-        index.start(repo_id, pr_id, repo_name=full_name),
+        index.scope(),
         workflows.track_workflows(repo_id, head_repo_id, head_sha) as tracked_workflows,
     ):
         token = await tokens.installation_token(http, installation_id)
         git_url = f"https://x-access-token:{token}@github.com/{head_name}.git"
-        _LOGGER.info("Cloning %s:%s branch %s", full_name, pr_id, head_ref)
         run_ctx = _RunCheck(http, token=token, repo_name=full_name, commit_hash=head_sha)
+        _LOGGER.info("Cloning %s:%s branch %s", full_name, pr_id, head_ref)
 
-        async with run_ctx, _with_cloned(run_ctx.output, git_url, branch=head_ref) as temp_dir_path:
-            config = await piped_shared.Config.read_async(temp_dir_path)
-            if not config.bot_actions:
+        async with run_ctxm _with_cloned(run_ctx.output, git_url, branch=head_ref) as temp_dir_path:
+            config_ = await config.Config.read_async(temp_dir_path)
+            if not config_.bot_actions:
                 _LOGGER.warning("Received event from %s repo with no bot_wait_for", full_name)
                 return
 
             await run_ctx.mark_running()
-            async for workflow in tracked_workflows.filter_names(config.bot_actions):
+            async for workflow in tracked_workflows.filter_names(config_.bot_actions):
                 await _apply_patch(http, run_ctx.output, token, full_name, workflow, cwd=temp_dir_path)
 
             await run_process(run_ctx.output, ["git", "push"], cwd=temp_dir_path)
 
-
-async def _apply_patch(
-    http: httpx.AsyncClient,
-    output: typing.IO[str],
-    token: str,
-    repo_name: str,
-    workflow: _Workflow,
-    /,
-    *,
-    cwd: pathlib.Path,
-) -> None:
-    """Apply a patch file from another workflow's artifacts and commit its changes.
-
-    This specifically looks for an artefact called `gogo.patch` and unzips it
-    to get the file at `./gogo.patch`.
-
-    Parameters
-    ----------
-    http
-        The REST client to use to scan and download the workflow's artefacts.
-    output
-        String file-like object this should pipe GIT's output to.
-    token
-        The integration token to use.
-
-        This must be authorised for `actions: read`.
-    repo_name
-        The repo's full name in the format `"{owner_name}/{repo_name}"`.
-    workflow
-        The workflow run to apply the patch of (if set).
-    cwd
-        Path to the target repo's top level directory.
-    """
-    # TODO: pagination support
-    response = await _request(
-        http,
-        "GET",
-        f"https://api.github.com/repos/{repo_name}/actions/runs/{workflow.workflow_id}/artifacts",
-        output=output,
-        query={"per_page": "100"},
-        token=token,
-    )
-    for artifact in response.json()["artifacts"]:
-        if artifact["name"] != "gogo.patch":
-            continue
-
-        response = await _request(http, "GET", artifact["archive_download_url"], output=output, token=token)
-        zipped = zipfile.ZipFile(io.BytesIO(await response.aread()))
-        # It's safe to extract to cwd since gogo.patch is git ignored.
-        patch_path = await anyio.to_thread.run_sync(zipped.extract, "gogo.patch", cwd)
-
-        try:
-            # TODO: could --3way or --unidiff-zero help with conflicts here?
-            await run_process(output, ["git", "apply", patch_path], cwd=cwd)
-
-        # If this conflicted then we should allow another CI run to redo these
-        # changes after the current changes have been pushed.
-        except subprocess.CalledProcessError:
-            await anyio.to_thread.run_sync(pathlib.Path(patch_path).unlink)
-
-        else:
-            await anyio.to_thread.run_sync(pathlib.Path(patch_path).unlink)
-            await run_process(output, ["git", "add", "."], cwd=cwd, env=COMMIT_ENV)
-            await run_process(output, ["git", "commit", "-am", workflow.name], cwd=cwd, env=COMMIT_ENV)
-
-        break
 
 
 async def run_process(

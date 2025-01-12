@@ -5,6 +5,7 @@ version = "0.1.0"
 
 [dependency-groups]
 main = [
+    "anyio",
     "asgiref",
     "fastapi",
     "httpx[http2]",
@@ -52,7 +53,7 @@ force_single_line = true
 [tool.piped]
 default_sessions = ["reformat", "verify-markup", "lint", "spell-check", "type-check"]
 hide = ["build", "generate_docs", "publish", "slot-check", "test", "test_coverage", "test_publish", "verify_types"]
-top_level_targets = ["./noxfile.py", "./main.py"]
+top_level_targets = ["./noxfile.py", "./src"]
 
 [tool.piped.github_actions."*"]
 default_py_ver = "3.12"
@@ -67,7 +68,7 @@ default_py_ver = "3.12"
 [tool.piped.github_actions.upgrade_locks]
 
 [tool.pyright]
-include = ["main.py"]
+include = ["src.py"]
 
 pythonVersion = "3.12"
 typeCheckingMode = "strict"

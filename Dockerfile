@@ -15,7 +15,7 @@ FROM registry.access.redhat.com/ubi9/python-312@sha256:88ea2d10c741f169681102b46
 WORKDIR /workspace
 
 COPY --from=install /workspace/.venv ./venv
-COPY ./main.py ./main.py
+COPY ./src ./src
 
 # TODO: https://github.com/ome/devspace/issues/38?
-ENTRYPOINT ["./venv/bin/python", "-m", "uvicorn", "main:app", "--proxy-headers", "--host", "0.0.0.0", "--port", "80"]
+ENTRYPOINT ["./venv/bin/python", "-m", "uvicorn", "src.main:app", "--proxy-headers", "--host", "0.0.0.0", "--port", "8080"]
