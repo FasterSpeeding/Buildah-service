@@ -1,0 +1,34 @@
+name: Resync piped
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths: ["piped", "piped.toml", "pyproject.toml"]
+
+jobs:
+  resync-piped:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: "true"
+
+      - name: Install Python
+        uses: ./.github/actions/setup-py
+
+      - name: Resync Piped
+        run: nox -s copy-piped bot-package-diff
+
+      - uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b
+        with:
+          name: gogo.patch
+          path: gogo.patch
+
+      - name: Check diff file
+        run: nox -s is-diff-file-empty

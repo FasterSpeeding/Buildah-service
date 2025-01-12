@@ -1,0 +1,139 @@
+[project]
+name = "buildah-service"
+requires-python = ">=3.11"
+version = "0.1.0"
+
+[dependency-groups]
+main = [
+    "anyio",
+    "asgiref",
+    "fastapi",
+    "httpx[http2]",
+    "jwt",
+    "python-dateutil",
+    "python-dotenv",
+    "uvicorn",
+    "uvloop; platform_system != 'Windows'",
+]
+freeze-locks = ["uv"]
+lint = [
+    "codespell>=2.2.2",
+    "pre-commit-hooks>=4.4",
+    "slotscheck>=0.16.1",
+    "ruff",
+]
+reformat = [
+    "black>=22.10.0",
+    "isort>=5.11.3",
+    "pre-commit-hooks>=4.4",
+    "pycln>=2.1.2",
+    "sort-all>=1.2",
+]
+templating = ["Jinja2>=3.1.2"]
+type-checking = [
+    "mypy>=0.991",
+    "nox",
+    "pyright>=1.1.285",
+    {include-group = "main"},
+]
+
+[tool.black]
+include         = ".*py$"
+line-length     = 120
+skip-magic-trailing-comma = true
+target-version  = ["py312"]
+
+[tool.codespell]
+ignore-regex = "nd|swith"
+
+[tool.isort]
+profile = "black"
+force_single_line = true
+
+[tool.piped]
+default_sessions = ["reformat", "verify-markup", "lint", "spell-check", "type-check"]
+hide = ["build", "generate_docs", "publish", "slot-check", "test", "test_coverage", "test_publish", "verify_types"]
+top_level_targets = ["./noxfile.py", "./src"]
+
+[tool.piped.github_actions."*"]
+default_py_ver = "3.12"
+
+[tool.piped.github_actions.docker_publish]
+[tool.piped.github_actions.freeze_for_pr]
+[tool.piped.github_actions.lint]
+[tool.piped.github_actions.reformat]
+[tool.piped.github_actions.resync_piped]
+[tool.piped.github_actions.type_check]
+[tool.piped.github_actions.update_licence]
+[tool.piped.github_actions.upgrade_locks]
+
+[tool.pyright]
+include = ["src.py"]
+
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingModuleSource = "error"  # Is only "warning" on strict mode.
+
+# Error code which are disabled even when general strict.
+reportShadowedImports = "error"
+reportCallInDefaultInitializer = "none"  # Ended up just complaining about cases where this was fine (e.g. timedeltas).
+reportImplicitStringConcatenation = "none"  # Conflicts with flake8 config.
+reportMissingSuperCall = "none"  # Way too strict (requires calls to `object.__init__`).
+reportPropertyTypeMismatch = "error"
+reportUninitializedInstanceVariable = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportUnusedCallResult = "none"  # Enforces doing `_ = ...`.
+
+# Error codes which lead to too many false-positives.
+reportIncompatibleMethodOverride = "warning"  # This relies on ordering for key-word only arguments which is annoying
+                                           # than it's worth
+reportUnknownMemberType = "warning"  # This messes with instance checking generic objects
+reportUnknownArgumentType = "warning"  # Pretty much the same as reportUnknownMemberType
+reportUnknownParameterType = "warning"  # Pretty much the same as reportUnknownMemberType
+reportUnusedFunction = "warning"  # This assumes decorator calls don't load a function into something for usage
+reportImportCycles = "warning"                  # This isn't necessarily an issue if it's type checking only.
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "ANN401",  # Dynamically typed expressions (typing.Any) are disallowed in ``
+    "B008",    # Do not perform function call `` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+    "COM812",  # Trailing comma missing (incompatible with black)
+    "D100",    # Missing docstring in public module
+    "D101",    # Missing docstring in public class
+    "D102",    # Missing docstring in public method
+    "D103",    # Missing docstring in public function
+    "D104",    # Missing docstring in public package
+    "D105",    # Missing docstring in magic method
+    "FIX002",  # Line contains TODO, consider resolving the issue
+    "I001",    # [*] Import block is un-sorted or un-formatted
+    "N818",    # Exception name `FailedModuleUnload` should be named with an Error suffix
+    "PYI041",  # Use `float` instead of `int | float`
+    "RUF022",  # [*] `__all__` is not sorted  # Incompatible with black.
+    "S101",    # Use of `assert` detected
+    "SIM105",  # Use `contextlib.suppress(Error)` instead of `try`-`except`-`pass`
+    "SIM108",  # Use ternary operator `` instead of `if`-`else`-block
+    "TD002",   # Missing author in TODO; try: `# TODO(<author_name>): ...` or `# TODO @<author_name>: ...`
+    "TD003",   # Missing issue link on the line following this TODO
+]
+
+[tool.ruff.lint.per-file-ignores]
+"noxfile.py" = [
+    "F403",  # `from noxfile import *` used; unable to detect names
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 20
+
+[tool.ruff.lint.pycodestyle]
+# Technically this is 120, but black has a policy of "1 or 2 over is fine if it is tidier", so we have to raise this.
+max-line-length = 130
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.pylint]
+max-args = 20
+max-branches = 20
+max-returns = 15
+max-statements = 100
